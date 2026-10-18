@@ -31,7 +31,9 @@ static GPU cards[MAX_GPU];
 static unsigned int count;
 static HMODULE nvml;
 static UtilFn getUtil; static MemFn getMemory; static ShutdownFn shutdownNvml;
-static HWND window, taskbar;
+static HWND window, taskbar, controller;
+static LRESULT CALLBACK proc(HWND,UINT,WPARAM,LPARAM);
+static void maintainDisplay(void);
 static HANDLE stopEvent, wakeEvent, worker, singleton;
 static CRITICAL_SECTION guard;
 static volatile LONG interval=1000;
@@ -151,7 +153,7 @@ static int initialize(void) {
         MultiByteToWideChar(CP_UTF8,0,label,-1,card->name,96); catalog->count++;
     }
     if(!catalog->count) { free(catalog); disconnectNvml(); return 0; }
-    if(window) { if(!PostMessageW(window,CATALOG_MSG,0,(LPARAM)catalog)) free(catalog); }
+    if(controller) { if(!PostMessageW(controller,CATALOG_MSG,0,(LPARAM)catalog)) free(catalog); }
     else { count=catalog->count; memcpy(cards,catalog->cards,sizeof(cards)); free(catalog); }
     return 1;
 }
@@ -206,7 +208,7 @@ static DWORD WINAPI samplingThread(void* unused) {
     HANDLE events[2]={stopEvent,wakeEvent};
     for(;;) {
         int sleeping=paused();
-        if(!sleeping && sample()) PostMessageW(window,SAMPLE_MSG,0,0);
+        if(!sleeping && sample()) PostMessageW(controller,SAMPLE_MSG,0,0);
         DWORD wait=WaitForMultipleObjects(2,events,FALSE,sleeping?INFINITE:(DWORD)atomicRead(&interval));
         if(wait!=WAIT_TIMEOUT && wait!=WAIT_OBJECT_0+1) break;
     }
@@ -291,6 +293,7 @@ static int restoreTaskbarStacking(void) {
     RECT widget,bar,overlap;
     if(paused()||!window||!taskbar||!IsWindowVisible(window)||!IsWindowVisible(taskbar)) return 0;
     if(!GetWindowRect(window,&widget)||!GetWindowRect(taskbar,&bar)||!IntersectRect(&overlap,&widget,&bar)) return 0;
+    if(GetWindow(window,GW_OWNER)==taskbar) return 0; /* Windows keeps owned popups above their owner. */
     /* Explorer can raise its topmost taskbar without moving either window.
        Repair only that overlap; do not reposition or activate the widget. */
     HWND above=GetWindow(window,GW_HWNDPREV);
@@ -313,9 +316,32 @@ static void refreshVisibility(void) {
     if(!hide) restoreTaskbarStacking();
 }
 static void powerStateChanged(void) {
-    if(atomicRead(&screenOff)||atomicRead(&sessionLocked)||atomicRead(&suspended)) KillTimer(window,1);
-    else SetTimer(window,1,1000,NULL);
+    if(atomicRead(&screenOff)||atomicRead(&sessionLocked)||atomicRead(&suspended)) KillTimer(controller,1);
+    else SetTimer(controller,1,1000,NULL);
     refreshVisibility(); SetEvent(wakeEvent);
+}
+static HWND createOwnedDisplay(HWND owner) {
+    return CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,L"AIPulse.Native",L"AI Pulse",WS_POPUP,0,0,width,height,owner,NULL,GetModuleHandleW(NULL),NULL);
+}
+static int ensureDisplayOwner(HWND owner) {
+    if(window && IsWindow(window) && GetWindow(window,GW_OWNER)!=owner) DestroyWindow(window);
+    taskbar=owner;
+    if(!taskbar) { InterlockedExchange(&hidden,1); SetEvent(wakeEvent); return 0; }
+    if(window && IsWindow(window)) return 0;
+    window=createOwnedDisplay(taskbar);
+    if(!window) { InterlockedExchange(&hidden,1); SetEvent(wakeEvent); return 0; }
+    return 1;
+}
+static void maintainDisplay(void) {
+    int created=ensureDisplayOwner(FindWindowW(L"Shell_TrayWnd",NULL));
+    if(!window) return;
+    if(created) {
+        anchor();
+        if(!paused()) ShowWindow(window,SW_SHOWNOACTIVATE);
+        InvalidateRect(window,NULL,FALSE);
+    }
+    if(!customPosition&&!dragging) anchor();
+    refreshVisibility();
 }
 static void textAt(HDC dc,const wchar_t* s,int left,int top,int right,int bottom,UINT align,HFONT font,COLORREF color) {
     RECT r={left,top,right,bottom}; SelectObject(dc,font); SetTextColor(dc,color);
@@ -426,15 +452,15 @@ static void menu(void) {
     if(result==2) { customPosition=0; anchor(); }
     if(result>=3 && result<=5) { InterlockedExchange(&interval,result==3?1000:result==4?2000:5000); SetEvent(wakeEvent); }
     if(result==6) toggleStartup();
-    if(result==7) DestroyWindow(window); else if(result) saveSettings();
+    if(result==7) PostMessageW(controller,WM_CLOSE,0,0); else if(result) saveSettings();
 }
 static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
-    if(taskbarCreated && msg==taskbarCreated) { taskbar=NULL; anchor(); refreshVisibility(); return 0; }
+    if(w==controller && taskbarCreated && msg==taskbarCreated) { taskbar=NULL; maintainDisplay(); return 0; }
     switch(msg) {
-    case WM_PAINT: paint(); return 0;
+    case WM_PAINT: if(w==window) { paint(); return 0; } break;
     case WM_ERASEBKGND: return 1;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case SAMPLE_MSG: InvalidateRect(w,NULL,FALSE); return 0;
+    case SAMPLE_MSG: if(window) InvalidateRect(window,NULL,FALSE); return 0;
     case CATALOG_MSG: {
         Catalog* catalog=(Catalog*)lp;
         EnterCriticalSection(&guard);
@@ -443,8 +469,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         free(catalog); saveInventory(); layout(); SetEvent(wakeEvent); return 0;
     }
     case WM_TIMER:
-        if(!customPosition&&!dragging) anchor();
-        refreshVisibility(); return 0;
+        maintainDisplay(); return 0;
     case WM_WTSSESSION_CHANGE:
         if(wp==WTS_SESSION_LOCK) InterlockedExchange(&sessionLocked,1);
         if(wp==WTS_SESSION_UNLOCK) InterlockedExchange(&sessionLocked,0);
@@ -461,8 +486,8 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             InterlockedExchange(&suspended,0); InterlockedExchange(&forceReconnect,1); powerStateChanged();
         }
         return TRUE;
-    case WM_SETTINGCHANGE: case WM_THEMECHANGED: updateTheme(); InvalidateRect(w,NULL,FALSE); return 0;
-    case WM_DISPLAYCHANGE: anchor(); return 0;
+    case WM_SETTINGCHANGE: case WM_THEMECHANGED: updateTheme(); if(window) InvalidateRect(window,NULL,FALSE); return 0;
+    case WM_DISPLAYCHANGE: maintainDisplay(); return 0;
     case WM_CONTEXTMENU: menu(); return 0;
     case WM_LBUTTONDOWN:
         if(!locked) { RECT r; dragging=1; GetCursorPos(&dragStart); GetWindowRect(w,&r); windowStart.x=r.left; windowStart.y=r.top; SetCapture(w); } return 0;
@@ -471,18 +496,31 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_LBUTTONUP:
         if(dragging) { dragging=0; ReleaseCapture(); customPosition=1; saveSettings(); } return 0;
     case WM_CAPTURECHANGED: dragging=0; return 0;
-    case WM_CLOSE: DestroyWindow(w); return 0;
+    case WM_CLOSE:
+        if(window && IsWindow(window)) DestroyWindow(window);
+        if(controller && IsWindow(controller)) DestroyWindow(controller);
+        return 0;
     case WM_DESTROY:
-        KillTimer(w,1); WTSUnRegisterSessionNotification(w);
-        if(powerNotification) UnregisterPowerSettingNotification(powerNotification);
-        SetEvent(stopEvent); PostQuitMessage(0); return 0;
+        if(w==window) {
+            window=NULL; dragging=0; InterlockedExchange(&hidden,1); SetEvent(wakeEvent);
+        }
+        if(w==controller) {
+            KillTimer(w,1); WTSUnRegisterSessionNotification(w);
+            if(powerNotification) UnregisterPowerSettingNotification(powerNotification);
+            SetEvent(stopEvent); PostQuitMessage(0);
+        }
+        return 0;
     }
     return DefWindowProcW(w,msg,wp,lp);
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE prev,LPWSTR args,int show) {
     (void)prev; (void)show;
     /* Stable AI Pulse identity for single-instance control. */
-    if(wcsstr(args,L"--quit")) { HWND existing=FindWindowW(L"AIPulse.Native",NULL); if(existing) PostMessageW(existing,WM_CLOSE,0,0); return 0; }
+    if(wcsstr(args,L"--quit")) {
+        HWND existing=FindWindowW(L"AIPulse.Controller",NULL);
+        if(!existing) existing=FindWindowW(L"AIPulse.Native",NULL);
+        if(existing) PostMessageW(existing,WM_CLOSE,0,0); return 0;
+    }
     singleton=CreateMutexW(NULL,TRUE,L"Local\\AIPulse.Native.v1");
     if(!singleton||GetLastError()==ERROR_ALREADY_EXISTS) return 0;
     SetProcessDPIAware(); InitializeCriticalSection(&guard);
@@ -506,14 +544,15 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE prev,LPWSTR args,int show) {
     layout();
     updateTheme(); stopEvent=CreateEventW(NULL,TRUE,FALSE,NULL); wakeEvent=CreateEventW(NULL,FALSE,FALSE,NULL);
     WNDCLASSW cls={0}; cls.lpfnWndProc=proc; cls.hInstance=instance; cls.lpszClassName=L"AIPulse.Native"; cls.hCursor=LoadCursor(NULL,IDC_ARROW); RegisterClassW(&cls);
-    taskbar=FindWindowW(L"Shell_TrayWnd",NULL);
-    /* Independent tool window survives an Explorer/taskbar restart. */
-    window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,L"AIPulse.Native",L"AI Pulse",WS_POPUP,0,0,width,height,NULL,NULL,instance,NULL);
-    if(!window) return 2;
+    /* Explorer owns the display to maintain its stacking atomically. The hidden
+       controller survives owner destruction and recreates the display. */
+    cls.lpszClassName=L"AIPulse.Controller"; RegisterClassW(&cls);
+    controller=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"AIPulse.Controller",L"AI Pulse Controller",WS_POPUP,0,0,0,0,NULL,NULL,instance,NULL);
+    if(!controller) return 2;
     taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
-    WTSRegisterSessionNotification(window,NOTIFY_FOR_THIS_SESSION);
-    powerNotification=RegisterPowerSettingNotification(window,&displayStateGuid,DEVICE_NOTIFY_WINDOW_HANDLE);
-    anchor(); SetTimer(window,1,1000,NULL); ShowWindow(window,SW_SHOWNOACTIVATE); refreshVisibility();
+    WTSRegisterSessionNotification(controller,NOTIFY_FOR_THIS_SESSION);
+    powerNotification=RegisterPowerSettingNotification(controller,&displayStateGuid,DEVICE_NOTIFY_WINDOW_HANDLE);
+    SetTimer(controller,1,1000,NULL); maintainDisplay();
     worker=CreateThread(NULL,0,samplingThread,NULL,0,NULL);
     MSG msg; while(GetMessageW(&msg,NULL,0,0)>0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     SetEvent(stopEvent); if(worker) { WaitForSingleObject(worker,INFINITE); CloseHandle(worker); }
