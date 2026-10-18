@@ -287,6 +287,22 @@ static int shouldHide(void) {
     }
     return 0;
 }
+static int restoreTaskbarStacking(void) {
+    RECT widget,bar,overlap;
+    if(paused()||!window||!taskbar||!IsWindowVisible(window)||!IsWindowVisible(taskbar)) return 0;
+    if(!GetWindowRect(window,&widget)||!GetWindowRect(taskbar,&bar)||!IntersectRect(&overlap,&widget,&bar)) return 0;
+    /* Explorer can raise its topmost taskbar without moving either window.
+       Repair only that overlap; do not reposition or activate the widget. */
+    HWND above=GetWindow(window,GW_HWNDPREV);
+    for(int checked=0;above && checked<512;checked++,above=GetWindow(above,GW_HWNDPREV)) {
+        if(above==taskbar) {
+            int raised=SetWindowPos(window,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            if(raised) InvalidateRect(window,NULL,FALSE);
+            return raised;
+        }
+    }
+    return 0;
+}
 static void refreshVisibility(void) {
     int hide=atomicRead(&screenOff)||atomicRead(&sessionLocked)||atomicRead(&suspended)||shouldHide();
     if(InterlockedExchange(&hidden,hide)!=hide) {
@@ -294,6 +310,7 @@ static void refreshVisibility(void) {
         if(!hide) InvalidateRect(window,NULL,FALSE);
         SetEvent(wakeEvent);
     }
+    if(!hide) restoreTaskbarStacking();
 }
 static void powerStateChanged(void) {
     if(atomicRead(&screenOff)||atomicRead(&sessionLocked)||atomicRead(&suspended)) KillTimer(window,1);
