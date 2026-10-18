@@ -1,0 +1,31 @@
+# Toolchains and generated files
+/tools/
+/out/
+/backups/
+/reports/
+/archive/
+*.exe
+*.dll
+*.obj
+*.pdb
+*.zip
+*.lnk
+*.ini
+*.log
+*.tmp
+
+# Machine-local paths, runtime settings, and personal notes
+/update.local.json
+/powershell-path.local.txt
+/사용법.txt
+/업데이트.txt
+
+# Test results and fixtures
+/tests/updater-fixture-*/
+/tests/click-launcher-fixture/
+/tests/*.json
+/tests/*results.txt
+
+.DS_Store
+Thumbs.db
+Desktop.ini
