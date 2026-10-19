@@ -71,7 +71,7 @@ try {
     $result=[pscustomobject]@{
         UpdatedAt=(Get-Date -Format o);Executable=$targetExe;ProcessId=$startedProcess.Id
         SettingsUnchanged=($settingsHash -eq (Get-FileHash -LiteralPath $settings).Hash)
-        StartupUnchanged=($startupBefore.Exists -eq $startupAfter.Exists -and $startupBefore.Value -ceq $startupAfter.Value)
+        StartupUnchanged=($startupBefore.Exists -eq $startupAfter.Exists -and $startupBefore.Value -ceq $startupAfter.Value -and $startupBefore.TaskXml -ceq $startupAfter.TaskXml)
         BackupDirectory=$backupDirectory;ExecutableHash=(Get-FileHash -LiteralPath $targetExe).Hash
     }
     New-Item -ItemType Directory -Path (Join-Path $PSScriptRoot 'reports') -Force | Out-Null

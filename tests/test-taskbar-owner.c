@@ -29,6 +29,9 @@ int main(void) {
     CHECK(GetForegroundWindow()==foreground,"owner raises do not steal focus");
     GetWindowRect(window,&after); CHECK(EqualRect(&before,&after),"owner raises preserve display geometry");
     CHECK(!ensureDisplayOwner(owner) && window==original,"unchanged owner does not recreate the display");
+    SendMessageW(window,WM_CLOSE,0,0);
+    CHECK(!window && IsWindow(controller) && WaitForSingleObject(stopEvent,0)==WAIT_TIMEOUT,"shell display close preserves the controller and worker");
+    CHECK(ensureDisplayOwner(owner),"display close is recoverable without restarting the app");
     DestroyWindow(owner);
     CHECK(!window && IsWindow(controller),"owner destruction leaves the hidden controller running");
     CHECK(WaitForSingleObject(stopEvent,0)==WAIT_TIMEOUT,"owner destruction does not stop the app");

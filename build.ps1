@@ -10,5 +10,5 @@ if (!(Test-Path $compiler)) {
 }
 if((& $compiler version).Trim() -ne '0.15.2') { throw 'This build requires Zig 0.15.2.' }
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $PSScriptRoot 'tools/cache'
-& $compiler cc -target x86_64-windows-gnu -Os -s -municode '-Wl,--subsystem,windows' (Join-Path $PSScriptRoot 'aipulse.c') -o $OutputPath -luser32 -lgdi32 -ladvapi32 -lwtsapi32
+& $compiler cc -target x86_64-windows-gnu -Os -s -municode '-Wl,--subsystem,windows' (Join-Path $PSScriptRoot 'aipulse.c') -o $OutputPath -luser32 -lgdi32 -ladvapi32 -lwtsapi32 -lole32 -loleaut32 -luuid -lshell32
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }

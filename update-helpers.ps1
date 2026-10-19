@@ -17,8 +17,11 @@ function Install-AIPulseExecutable {
 
 function Get-AIPulseStartupState {
     $key='HKCU:/Software/Microsoft/Windows/CurrentVersion/Run'
-    if(!(Test-Path -LiteralPath $key)) { return [pscustomobject]@{Exists=$false;Value=$null} }
-    $properties=Get-ItemProperty -LiteralPath $key -ErrorAction Stop
-    $entry=$properties.PSObject.Properties['AIPulse']
-    return [pscustomobject]@{Exists=($null -ne $entry);Value=$(if($entry){$entry.Value}else{$null})}
+    $entry=$null
+    if(Test-Path -LiteralPath $key) { $entry=(Get-ItemProperty -LiteralPath $key).PSObject.Properties['AIPulse'] }
+    $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $name='AIPulse-'+$sid
+    $task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    $xml=if($task){Export-ScheduledTask -TaskName $name}else{$null}
+    [pscustomobject]@{Exists=($null -ne $entry);Value=$(if($entry){$entry.Value}else{$null});TaskXml=$xml}
 }

@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wtsapi32.h>
+#define COBJMACROS
+#include <taskschd.h>
+#include <sddl.h>
+#include <shlobj.h>
 
 #define MAX_GPU 16
 #define SAMPLE_MSG (WM_APP+1)
@@ -54,6 +58,22 @@ static MEMORYSTATUSEX ram={sizeof(MEMORYSTATUSEX)};
 static int locked=1,customPosition=0,dragging=0,darkMode=1;
 static POINT dragStart,windowStart;
 static wchar_t ini[MAX_PATH];
+static void lifecycle(const wchar_t* event,DWORD error) {
+    wchar_t directory[MAX_PATH],file[MAX_PATH],line[512]; char utf8[2048];
+    if(FAILED(SHGetFolderPathW(NULL,CSIDL_LOCAL_APPDATA,NULL,SHGFP_TYPE_CURRENT,directory))||lstrlenW(directory)>MAX_PATH-32) return;
+    lstrcatW(directory,L"\\AIPulse"); CreateDirectoryW(directory,NULL);
+    swprintf(file,MAX_PATH,L"%ls\\startup.log",directory);
+    WIN32_FILE_ATTRIBUTE_DATA attrs; DWORD disposition=OPEN_ALWAYS;
+    if(GetFileAttributesExW(file,GetFileExInfoStandard,&attrs) && (attrs.nFileSizeHigh||attrs.nFileSizeLow>65536)) disposition=CREATE_ALWAYS;
+    HANDLE log=CreateFileW(file,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,disposition,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(log==INVALID_HANDLE_VALUE) return;
+    SetFilePointer(log,0,NULL,FILE_END);
+    SYSTEMTIME t; GetLocalTime(&t);
+    swprintf(line,512,L"%04u-%02u-%02u %02u:%02u:%02u pid=%lu event=%ls code=%lu\r\n",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,GetCurrentProcessId(),event,error);
+    int bytes=WideCharToMultiByte(CP_UTF8,0,line,-1,utf8,sizeof(utf8),NULL,NULL); DWORD written;
+    if(bytes>1) WriteFile(log,utf8,bytes-1,&written,NULL);
+    CloseHandle(log);
+}
 static COLORREF bg,fg,muted;
 static int px(int n) { return MulDiv(n,dpi,96); }
 static unsigned long long displayedTenths(unsigned long long bytes) {
@@ -396,15 +416,55 @@ static void paint(void) {
     BitBlt(dc,0,0,width,height,mem,0,0,SRCCOPY);
     SelectObject(mem,old); DeleteObject(bitmap); DeleteDC(mem); EndPaint(window,&ps);
 }
-static int startupEnabled(void) {
+static int startupTaskName(wchar_t* name,size_t capacity) {
+    HANDLE token=NULL; DWORD bytes=0; TOKEN_USER* user=NULL; LPWSTR sid=NULL; int ok=0;
+    if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) return 0;
+    GetTokenInformation(token,TokenUser,NULL,0,&bytes);
+    user=(TOKEN_USER*)malloc(bytes);
+    if(user && GetTokenInformation(token,TokenUser,user,bytes,&bytes) && ConvertSidToStringSidW(user->User.Sid,&sid)) {
+        if(lstrlenW(sid)+9<(int)capacity) { swprintf(name,capacity,L"AIPulse-%ls",sid); ok=1; }
+    }
+    if(sid) LocalFree(sid); free(user); CloseHandle(token); return ok;
+}
+static IRegisteredTask* startupTask(int* initialized) {
+    *initialized=0; HRESULT hr=CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
+    if(FAILED(hr) && hr!=RPC_E_CHANGED_MODE) return NULL;
+    *initialized=SUCCEEDED(hr);
+    ITaskService* service=NULL; ITaskFolder* folder=NULL; IRegisteredTask* task=NULL;
+    VARIANT empty; VariantInit(&empty); wchar_t name[128];
+    BSTR root=SysAllocString(L"\\"),taskName=NULL;
+    if(startupTaskName(name,128)) taskName=SysAllocString(name);
+    if(root && taskName && SUCCEEDED(CoCreateInstance(&CLSID_TaskScheduler,NULL,CLSCTX_INPROC_SERVER,&IID_ITaskService,(void**)&service)) &&
+       SUCCEEDED(ITaskService_Connect(service,empty,empty,empty,empty)) && SUCCEEDED(ITaskService_GetFolder(service,root,&folder)))
+        ITaskFolder_GetTask(folder,taskName,&task);
+    if(folder) ITaskFolder_Release(folder); if(service) ITaskService_Release(service);
+    SysFreeString(root); SysFreeString(taskName); return task;
+}
+static int runStartupEnabled(void) {
     wchar_t value[MAX_PATH+4]; DWORD sz=sizeof(value);
     return RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",L"AIPulse",RRF_RT_REG_SZ,NULL,value,&sz)==ERROR_SUCCESS;
 }
+static int startupEnabled(void) {
+    int initialized=0,enabled=runStartupEnabled(); IRegisteredTask* task=startupTask(&initialized);
+    if(task) { VARIANT_BOOL active=VARIANT_FALSE; if(SUCCEEDED(IRegisteredTask_get_Enabled(task,&active))) enabled|=active!=VARIANT_FALSE; IRegisteredTask_Release(task); }
+    if(initialized) CoUninitialize(); return enabled;
+}
 static void toggleStartup(void) {
-    HKEY key; wchar_t path[MAX_PATH],quoted[MAX_PATH+4]; int enabled=startupEnabled();
+    int initialized=0; IRegisteredTask* task=startupTask(&initialized);
+    if(task) {
+        VARIANT_BOOL active=VARIANT_FALSE; HRESULT hr=IRegisteredTask_get_Enabled(task,&active);
+        int enabled=(active!=VARIANT_FALSE)||runStartupEnabled();
+        if(SUCCEEDED(hr)) hr=IRegisteredTask_put_Enabled(task,enabled?VARIANT_FALSE:VARIANT_TRUE);
+        IRegisteredTask_Release(task); if(initialized) CoUninitialize();
+        if(SUCCEEDED(hr)) { HKEY key; if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_SET_VALUE,&key)==ERROR_SUCCESS) {RegDeleteValueW(key,L"AIPulse");RegCloseKey(key);} }
+        else MessageBoxW(window,L"자동 실행 설정을 변경하지 못했습니다.",L"AI Pulse",MB_OK|MB_ICONERROR);
+        return;
+    }
+    if(initialized) CoUninitialize();
+    HKEY key; wchar_t path[MAX_PATH],quoted[MAX_PATH+16]; int enabled=startupEnabled();
     if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,NULL,0,KEY_SET_VALUE,NULL,&key,NULL)!=ERROR_SUCCESS) return;
     if(enabled) RegDeleteValueW(key,L"AIPulse");
-    else { GetModuleFileNameW(NULL,path,MAX_PATH); swprintf(quoted,MAX_PATH+4,L"\"%ls\"",path); RegSetValueExW(key,L"AIPulse",0,REG_SZ,(BYTE*)quoted,(lstrlenW(quoted)+1)*sizeof(wchar_t)); }
+    else { GetModuleFileNameW(NULL,path,MAX_PATH); swprintf(quoted,MAX_PATH+16,L"\"%ls\" --startup",path); RegSetValueExW(key,L"AIPulse",0,REG_SZ,(BYTE*)quoted,(lstrlenW(quoted)+1)*sizeof(wchar_t)); }
     RegCloseKey(key);
 }
 static void menu(void) {
@@ -497,6 +557,8 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if(dragging) { dragging=0; ReleaseCapture(); customPosition=1; saveSettings(); } return 0;
     case WM_CAPTURECHANGED: dragging=0; return 0;
     case WM_CLOSE:
+        if(w==window) { lifecycle(L"display-close-recover",0); DestroyWindow(window); return 0; }
+        lifecycle(L"controller-close",0);
         if(window && IsWindow(window)) DestroyWindow(window);
         if(controller && IsWindow(controller)) DestroyWindow(controller);
         return 0;
@@ -505,6 +567,7 @@ static LRESULT CALLBACK proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             window=NULL; dragging=0; InterlockedExchange(&hidden,1); SetEvent(wakeEvent);
         }
         if(w==controller) {
+            lifecycle(L"controller-destroy",0);
             KillTimer(w,1); WTSUnRegisterSessionNotification(w);
             if(powerNotification) UnregisterPowerSettingNotification(powerNotification);
             SetEvent(stopEvent); PostQuitMessage(0);
@@ -521,12 +584,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE prev,LPWSTR args,int show) {
         if(!existing) existing=FindWindowW(L"AIPulse.Native",NULL);
         if(existing) PostMessageW(existing,WM_CLOSE,0,0); return 0;
     }
+    int startupLaunch=wcsstr(args,L"--startup")!=NULL;
+    lifecycle(startupLaunch?L"startup-launch":L"launch",0);
     singleton=CreateMutexW(NULL,TRUE,L"Local\\AIPulse.Native.v1");
-    if(!singleton||GetLastError()==ERROR_ALREADY_EXISTS) return 0;
+    if(!singleton||GetLastError()==ERROR_ALREADY_EXISTS) { lifecycle(L"already-running-or-mutex-error",GetLastError()); return 0; }
     SetProcessDPIAware(); InitializeCriticalSection(&guard);
     GetModuleFileNameW(NULL,ini,MAX_PATH); wchar_t* slash=wcsrchr(ini,L'\\'); if(slash) lstrcpyW(slash+1,L"AIPulse.ini");
     loadInventory();
-    if(initialize()) saveInventory();
+    if(!startupLaunch && initialize()) saveInventory();
     ramFields=GetPrivateProfileIntW(L"Display",L"RAM",3,ini)&3; loadFields();
     if(wcsstr(args,L"--snapshot")) {
         sample(); wchar_t out[MAX_PATH]; lstrcpyW(out,ini); wchar_t* s=wcsrchr(out,L'\\'); if(s) lstrcpyW(s+1,L"snapshot.txt");
@@ -548,14 +613,16 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE prev,LPWSTR args,int show) {
        controller survives owner destruction and recreates the display. */
     cls.lpszClassName=L"AIPulse.Controller"; RegisterClassW(&cls);
     controller=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"AIPulse.Controller",L"AI Pulse Controller",WS_POPUP,0,0,0,0,NULL,NULL,instance,NULL);
-    if(!controller) return 2;
+    if(!controller) { lifecycle(L"controller-create-failed",GetLastError()); return 2; }
     taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
     WTSRegisterSessionNotification(controller,NOTIFY_FOR_THIS_SESSION);
     powerNotification=RegisterPowerSettingNotification(controller,&displayStateGuid,DEVICE_NOTIFY_WINDOW_HANDLE);
     SetTimer(controller,1,1000,NULL); maintainDisplay();
+    lifecycle(L"ready",0);
     worker=CreateThread(NULL,0,samplingThread,NULL,0,NULL);
     MSG msg; while(GetMessageW(&msg,NULL,0,0)>0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     SetEvent(stopEvent); if(worker) { WaitForSingleObject(worker,INFINITE); CloseHandle(worker); }
     CloseHandle(stopEvent); CloseHandle(wakeEvent); DeleteObject(normalFont); DeleteObject(numberFont); disconnectNvml(); DeleteCriticalSection(&guard); CloseHandle(singleton);
+    lifecycle(L"exit",0);
     return 0;
 }
